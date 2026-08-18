@@ -560,8 +560,10 @@ function Test-ProtectedWorkspace([string]$Workspace, [string]$CodexRoot, [string
 
 function Move-WorkspacesToRecycleBin([string[]]$Workspaces, $RemainingThreads, [string]$CodexRoot, [string]$BackupPath) {
     Add-Type -AssemblyName Microsoft.VisualBasic
-    foreach ($workspace in $Workspaces | Select-Object -Unique) {
-        if ([string]::IsNullOrWhiteSpace($workspace) -or -not (Test-Path -LiteralPath $workspace -PathType Container)) { continue }
+    foreach ($workspaceValue in $Workspaces | Select-Object -Unique) {
+        if ([string]::IsNullOrWhiteSpace($workspaceValue)) { continue }
+        $workspace = Get-FullPath $workspaceValue
+        if (-not (Test-Path -LiteralPath $workspace -PathType Container)) { continue }
         if (Test-ProtectedWorkspace $workspace $CodexRoot $BackupPath) {
             Write-Warning "Protected workspace was not removed: $workspace"
             continue
@@ -574,9 +576,17 @@ function Move-WorkspacesToRecycleBin([string[]]$Workspaces, $RemainingThreads, [
         $automationHit = $false
         $automationFolder = Join-Path $CodexRoot 'automations'
         if (Test-Path -LiteralPath $automationFolder) {
+            $workspaceVariants = @($workspaceValue, $workspace | Where-Object { $_ } | Select-Object -Unique)
             foreach ($file in Get-ChildItem -LiteralPath $automationFolder -Recurse -File -ErrorAction SilentlyContinue) {
                 $raw = Get-Content -LiteralPath $file.FullName -Raw -ErrorAction SilentlyContinue
-                if ($raw -and $raw.IndexOf($workspace, [StringComparison]::OrdinalIgnoreCase) -ge 0) { $automationHit = $true; break }
+                if (-not $raw) { continue }
+                foreach ($workspaceVariant in $workspaceVariants) {
+                    if ($raw.IndexOf($workspaceVariant, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                        $automationHit = $true
+                        break
+                    }
+                }
+                if ($automationHit) { break }
             }
         }
         if ($automationHit) {
@@ -593,7 +603,7 @@ function Move-WorkspacesToRecycleBin([string[]]$Workspaces, $RemainingThreads, [
 }
 
 try {
-    Write-Host 'Codex 로컬 작업 정리 도구 for Windows 0.3.0' -ForegroundColor White
+    Write-Host 'Codex 로컬 작업 정리 도구 for Windows 0.3.1' -ForegroundColor White
     Write-Host '비공식 도구입니다. 복구 백업을 만든 뒤 로컬 Codex 메타데이터를 정리합니다.' -ForegroundColor DarkGray
     Assert-AppClosed
     $CodexHome = Get-FullPath $CodexHome
