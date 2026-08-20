@@ -183,6 +183,16 @@ function Get-ThreadTables([string]$Database) {
     return $result
 }
 
+function Get-MetadataDatabases([string]$CodexRoot) {
+    return @(
+        (Join-Path $CodexRoot 'logs_2.sqlite'),
+        (Join-Path $CodexRoot 'goals_1.sqlite'),
+        (Join-Path $CodexRoot 'memories_1.sqlite'),
+        (Join-Path $CodexRoot 'state_5.sqlite'),
+        (Join-Path $CodexRoot 'sqlite\codex-dev.db')
+    )
+}
+
 function Assert-SupportedSchema([string]$StateDb) {
     if (-not (Test-Path -LiteralPath $StateDb -PathType Leaf)) { throw "Missing state database: $StateDb" }
     $tables = [CodexCleaner.SqliteNative]::Query($StateDb, "SELECT name FROM sqlite_master WHERE type='table'")
@@ -204,6 +214,25 @@ function Get-AllThreads([string]$StateDb) {
     return @([CodexCleaner.SqliteNative]::Query($StateDb, $sql))
 }
 
+function Get-CatalogOnlyThreads([string]$CatalogDb, $StateThreads) {
+    if (-not (Test-Path -LiteralPath $CatalogDb -PathType Leaf)) { return @() }
+    $tables = [CodexCleaner.SqliteNative]::Query($CatalogDb, "SELECT name FROM sqlite_master WHERE type='table' AND name='local_thread_catalog'")
+    if ($tables.Count -eq 0) { return @() }
+    $columns = @(Get-TableColumns $CatalogDb 'local_thread_catalog')
+    foreach ($required in @('thread_id','display_title','cwd')) {
+        if ($columns -notcontains $required) { return @() }
+    }
+
+    $stateIds = @{}
+    foreach ($thread in $StateThreads) { $stateIds[$thread['id']] = $true }
+    $updatedColumn = if ($columns -contains 'source_updated_at') { 'source_updated_at' } else { '0' }
+    $where = if ($columns -contains 'host_id') { " WHERE host_id='local'" } else { '' }
+    $sql = 'SELECT thread_id AS id, display_title AS name, cwd, ' + $updatedColumn +
+        " AS updated_at, '' AS rollout_path, '1' AS catalog_only FROM local_thread_catalog" + $where +
+        ' ORDER BY updated_at DESC'
+    return @([CodexCleaner.SqliteNative]::Query($CatalogDb, $sql) | Where-Object { -not $stateIds.ContainsKey($_['id']) })
+}
+
 function Get-ThreadLabel($Row) {
     foreach ($key in @('name','title','preview','first_user_message')) {
         if ($Row.ContainsKey($key) -and -not [string]::IsNullOrWhiteSpace($Row[$key])) {
@@ -214,12 +243,17 @@ function Get-ThreadLabel($Row) {
 }
 
 function Get-ThreadKind($Row) {
+    if ($Row.ContainsKey('catalog_only') -and $Row['catalog_only'] -eq '1') { return '목록잔상' }
     $source = if ($Row.ContainsKey('source')) { [string]$Row['source'] } else { '' }
     $threadSource = if ($Row.ContainsKey('thread_source')) { [string]$Row['thread_source'] } else { '' }
     $label = Get-ThreadLabel $Row
     if ($threadSource -eq 'subagent' -or $source -match 'subagent') { return '하위작업' }
     if ($source -eq 'exec' -or $label -like "You are executing an authenticated owner's request*") { return '자동화' }
     return '일반대화'
+}
+
+function Test-UserThread($Row) {
+    return (Get-ThreadKind $Row) -in @('일반대화','목록잔상')
 }
 
 function Get-ThreadUpdatedText($Row) {
@@ -245,6 +279,7 @@ function Get-WorkspaceLabel($Row) {
 }
 
 function Show-Threads($Threads) {
+    $Threads = @($Threads)
     $rows = for ($i = 0; $i -lt $Threads.Count; $i++) {
         $thread = $Threads[$i]
         $label = Get-ThreadLabel $thread
@@ -263,6 +298,7 @@ function Show-Threads($Threads) {
 }
 
 function Show-SelectedThreads($Threads) {
+    $Threads = @($Threads)
     for ($i = 0; $i -lt $Threads.Count; $i++) {
         $thread = $Threads[$i]
         Write-Host ('[' + ($i + 1) + '] ' + (Get-ThreadLabel $thread)) -ForegroundColor White
@@ -407,6 +443,11 @@ function Get-CoreFiles([string]$CodexRoot) {
         'session_index.jsonl','version.json'
     )
     $files = @($names | ForEach-Object { Join-Path $CodexRoot $_ } | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf })
+    $catalogDb = Join-Path $CodexRoot 'sqlite\codex-dev.db'
+    foreach ($suffix in @('','-wal','-shm')) {
+        $catalogFile = $catalogDb + $suffix
+        if (Test-Path -LiteralPath $catalogFile -PathType Leaf) { $files += $catalogFile }
+    }
     $files += @(Get-ChildItem -LiteralPath $CodexRoot -Force -File | Where-Object {
         $_.Name -eq '.codex-global-state.json' -or
         $_.Name -eq '.codex-global-state.json.bak' -or
@@ -423,8 +464,11 @@ function New-Backup([string]$CodexRoot, [string]$Root, [string[]]$Ids, $Threads,
     New-Item -ItemType Directory -Path $core,$payload -Force | Out-Null
     $coreNames = @()
     foreach ($file in Get-CoreFiles $CodexRoot) {
-        Copy-Item -LiteralPath $file -Destination (Join-Path $core ([IO.Path]::GetFileName($file))) -Force
-        $coreNames += [IO.Path]::GetFileName($file)
+        $relative = Get-RelativePath $CodexRoot $file
+        $destination = Join-Path $core $relative
+        New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force | Out-Null
+        Copy-Item -LiteralPath $file -Destination $destination -Force
+        $coreNames += $relative
     }
     $payloadRelative = @()
     foreach ($item in $TargetItems) {
@@ -449,9 +493,9 @@ function New-Backup([string]$CodexRoot, [string]$Root, [string[]]$Ids, $Threads,
 
 function Restore-Backup([string]$CodexRoot, $Backup) {
     Write-Host 'Restoring backup...' -ForegroundColor Yellow
-    foreach ($databaseName in @('state_5.sqlite','logs_2.sqlite','goals_1.sqlite','memories_1.sqlite')) {
+    foreach ($databaseName in Get-MetadataDatabases $CodexRoot) {
         foreach ($suffix in @('','-wal','-shm')) {
-            $current = Join-Path $CodexRoot ($databaseName + $suffix)
+            $current = $databaseName + $suffix
             if (Test-Path -LiteralPath $current) { Remove-Item -LiteralPath $current -Force }
         }
     }
@@ -459,6 +503,7 @@ function Restore-Backup([string]$CodexRoot, $Backup) {
         $source = Join-Path (Join-Path $Backup.Path 'core') $name
         $destination = Join-Path $CodexRoot $name
         if (Test-Path -LiteralPath $destination) { Remove-Item -LiteralPath $destination -Recurse -Force }
+        New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force | Out-Null
         Copy-Item -LiteralPath $source -Destination $destination -Recurse -Force
     }
     foreach ($relative in $Backup.PayloadRelative) {
@@ -507,7 +552,7 @@ function Get-DatabaseReferenceCount([string]$Database, [string[]]$Ids) {
 }
 
 function Assert-NoReferences([string]$CodexRoot, [string[]]$Ids, [string[]]$TargetItems) {
-    $databases = @('state_5.sqlite','logs_2.sqlite','goals_1.sqlite','memories_1.sqlite') | ForEach-Object { Join-Path $CodexRoot $_ }
+    $databases = @(Get-MetadataDatabases $CodexRoot)
     foreach ($database in $databases) {
         $count = Get-DatabaseReferenceCount $database $Ids
         if ($count -ne 0) { throw "Database references remain in $database ($count row(s))." }
@@ -603,7 +648,7 @@ function Move-WorkspacesToRecycleBin([string[]]$Workspaces, $RemainingThreads, [
 }
 
 try {
-    Write-Host 'Codex 로컬 작업 정리 도구 for Windows 0.3.1' -ForegroundColor White
+    Write-Host 'Codex 로컬 작업 정리 도구 for Windows 0.3.2' -ForegroundColor White
     Write-Host '비공식 도구입니다. 복구 백업을 만든 뒤 로컬 Codex 메타데이터를 정리합니다.' -ForegroundColor DarkGray
     Assert-AppClosed
     $CodexHome = Get-FullPath $CodexHome
@@ -612,8 +657,11 @@ try {
     Add-SqliteBridge
     $stateDb = Join-Path $CodexHome 'state_5.sqlite'
     Assert-SupportedSchema $stateDb
-    $allThreads = @(Get-AllThreads $stateDb)
-    $userThreads = @($allThreads | Where-Object { (Get-ThreadKind $_) -eq '일반대화' })
+    $stateThreads = @(Get-AllThreads $stateDb)
+    $catalogDb = Join-Path $CodexHome 'sqlite\codex-dev.db'
+    $catalogOnlyThreads = @(Get-CatalogOnlyThreads $catalogDb $stateThreads)
+    $allThreads = @((@($stateThreads) + @($catalogOnlyThreads)) | Where-Object { $null -ne $_ })
+    $userThreads = @($allThreads | Where-Object { Test-UserThread $_ })
     $hiddenCount = $allThreads.Count - $userThreads.Count
 
     if ($List) {
@@ -676,7 +724,7 @@ try {
 
     Write-Heading '최종 삭제 대상 확인'
     Show-SelectedThreads $selected
-    $internalSelected = @($selected | Where-Object { (Get-ThreadKind $_) -ne '일반대화' })
+    $internalSelected = @($selected | Where-Object { -not (Test-UserThread $_) })
     if ($internalSelected.Count) { Write-Warning "자동화 또는 하위 작업 $($internalSelected.Count)개가 포함되어 있습니다." }
     if ($descendants.Count) { Write-Warning ('연결된 하위 작업도 함께 제거됩니다: ' + ($descendants -join ', ')) }
     Write-Host "제거할 메타데이터·세션 항목: $($targetItems.Count)"
@@ -704,8 +752,8 @@ try {
 
     try {
         Write-Heading 'Metadata cleanup'
-        foreach ($name in @('logs_2.sqlite','goals_1.sqlite','memories_1.sqlite','state_5.sqlite')) {
-            Remove-DatabaseRows (Join-Path $CodexHome $name) $Id
+        foreach ($database in Get-MetadataDatabases $CodexHome) {
+            Remove-DatabaseRows $database $Id
         }
         Clean-SessionIndex (Join-Path $CodexHome 'session_index.jsonl') $Id
         Clean-GlobalStateFiles $CodexHome $Id

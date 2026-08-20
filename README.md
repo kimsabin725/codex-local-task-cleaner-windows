@@ -10,6 +10,7 @@ Codex 앱이나 Codex CLI, Python, Node.js를 별도로 설치하지 않습니�
 - 지원하는 DB 구조가 아니면 아무것도 수정하지 않고 중단합니다.
 - 정리 전 DB, 전역 상태, 세션 인덱스와 대상 세션 파일을 백업합니다.
 - 검증 실패 시 백업을 자동 복원합니다.
+- 본체가 이미 삭제됐지만 앱의 최근 목록에 남은 `목록잔상`도 표시하고 정리합니다.
 - 작업 폴더 삭제는 별도 선택이며 Windows 휴지통으로만 보냅니다.
 - 백업은 자동 삭제되지 않습니다.
 
@@ -57,6 +58,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\CodexTaskCleaner.ps1 -Id "
 
 - `state_5.sqlite`의 작업 및 하위 작업 관계
 - 로그, 목표, 메모리 DB의 해당 작업 참조
+- `sqlite\codex-dev.db`의 로컬 작업 카탈로그와 타임라인 참조
 - `session_index.jsonl`
 - 전역 UI 상태 JSON과 백업·임시 상태 파일
 - 해당 작업의 rollout 세션 파일
@@ -80,10 +82,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\CodexTaskCleaner.ps1 -Id "
 - Windows 10/11
 - Windows PowerShell 5.1 이상
 - 현재 ChatGPT/Codex 로컬 저장 구조의 `state_5.sqlite` 계열
+- `codex-dev.db`가 있는 최신 목록 구조와, 해당 DB가 없는 이전 구조
 
 ## 목록 분류
 
 - `일반대화`: 사용자가 ChatGPT 데스크톱 앱에서 시작한 로컬 Codex 대화
+- `목록잔상`: 실제 세션은 없지만 최근/고정 목록 카탈로그에 남아 있는 항목
 - `자동화`: 예약 실행, Outlook 연동 등 비대화형 실행 기록
 - `하위작업`: guardian 같은 내부 보조 작업
 
